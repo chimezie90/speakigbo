@@ -186,9 +186,16 @@ def web():
             )
         return nllb_tokenizer.batch_decode(generated, skip_special_tokens=True)[0]
 
+    def _split_sentences(text):
+        parts = re.split(r'(?<=[.!?])\s+', text)
+        return [p.strip() for p in parts if p.strip()]
+
     def translate_to_igbo(text: str) -> str:
         normalized = _normalize_text(text)
-        return _nllb_translate(normalized)
+        sentences = _split_sentences(normalized)
+        if len(sentences) <= 1:
+            return _nllb_translate(normalized)
+        return " ".join(_nllb_translate(s) for s in sentences)
 
     # Reference to GPU TTS class
     tts_model = TTSModel()

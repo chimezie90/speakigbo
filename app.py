@@ -151,13 +151,24 @@ def _normalize_text(text: str) -> str:
     return text
 
 
+def _split_sentences(text: str) -> list[str]:
+    """Split text into sentences. NLLB hallucinates on long input, so we translate sentence by sentence."""
+    # Split on sentence-ending punctuation followed by space or end
+    parts = re.split(r'(?<=[.!?])\s+', text)
+    return [p.strip() for p in parts if p.strip()]
+
+
 def translate_to_igbo(text: str) -> str:
     device = next(translator_model.parameters()).device
-    # Always normalize first — NLLB needs proper capitalization and punctuation
     normalized = _normalize_text(text)
-    result = _nllb_translate(normalized, device)
-    # If NLLB still echoed back, something is really off — return what we got
-    return result
+    # Split into sentences and translate each one to prevent hallucination
+    sentences = _split_sentences(normalized)
+    if len(sentences) <= 1:
+        return _nllb_translate(normalized, device)
+    translated = []
+    for sentence in sentences:
+        translated.append(_nllb_translate(sentence, device))
+    return " ".join(translated)
 
 
 class TranslateRequest(BaseModel):

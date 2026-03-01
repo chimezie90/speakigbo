@@ -43,8 +43,14 @@
         <span class="game-title">Eat the Jollof!</span>
         <span class="game-score-wrap">Score: <strong id="game-score">0</strong> | Best: <strong id="game-best">0</strong></span>
       </div>
-      <p class="game-hint">← → keys or tap left/right to move</p>
-      <canvas id="game-canvas"></canvas>
+      <p class="game-hint">↑↓ arrow keys or tap buttons to dodge</p>
+      <div class="game-play-area">
+        <canvas id="game-canvas"></canvas>
+        <div class="game-dpad">
+          <button id="btn-up" class="dpad-btn" aria-label="Move up">▲</button>
+          <button id="btn-down" class="dpad-btn" aria-label="Move down">▼</button>
+        </div>
+      </div>
     </div>
   </main>
 

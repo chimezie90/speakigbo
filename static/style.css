@@ -277,11 +277,46 @@ audio {
   margin-bottom: 6px;
 }
 
+.game-play-area {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
 #game-canvas {
-  width: 100%;
+  flex: 1;
   display: block;
   border-radius: 6px;
   background: #12141c;
+}
+
+.game-dpad {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.dpad-btn {
+  width: 44px;
+  height: 44px;
+  border-radius: 10px;
+  border: 1px solid #3a3d45;
+  background: #2a2d35;
+  color: #e4e4e7;
+  font-size: 1.1rem;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: manipulation;
+  transition: background 0.1s;
+}
+
+.dpad-btn:active {
+  background: #6366f1;
 }
 
 /* Mobile */

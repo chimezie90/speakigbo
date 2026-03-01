@@ -14,39 +14,65 @@ const bestEl = document.getElementById("game-best");
 if (bestEl) bestEl.textContent = bestScore;
 
 // ============================================================
-// Eat the Jollof — mini game while waiting
-// Player at bottom, items fall from top. Move left/right.
+// Eat the Jollof — 3-lane horizontal runner
+// Items scroll from right, player on left, up/down to dodge
 // ============================================================
 const game = (() => {
   let ctx;
   let running = false;
   let animFrame = null;
   let score = 0;
-  let fallSpeed = 2.5;
+  let speed = 4;
   let frameCount = 0;
   let dpr = 1;
   let W = 0;
   let H = 0;
 
-  const PLAYER_W = 32;
-  const PLAYER_H = 28;
-  const MOVE_SPEED = 6;
-  const player = { x: 0, targetX: 0 };
-  const PLAYER_Y_OFFSET = 10; // from bottom
+  const player = { x: 40, y: 0, w: 26, h: 26, lane: 1 };
+  const LANES = 3;
+  const LANE_H = 38;
+  const TOP_PAD = 8;
+
+  function laneY(lane) {
+    return TOP_PAD + lane * LANE_H + (LANE_H - player.h) / 2;
+  }
 
   let items = [];
+  let bgCanvas = null;
   let flashAlpha = 0;
   let flashColor = "";
 
-  function playerY() { return H - PLAYER_H - PLAYER_Y_OFFSET; }
+  function buildBg() {
+    bgCanvas = document.createElement("canvas");
+    bgCanvas.width = gameCanvas.width;
+    bgCanvas.height = gameCanvas.height;
+    const bg = bgCanvas.getContext("2d");
+    bg.scale(dpr, dpr);
+    bg.strokeStyle = "rgba(255,255,255,0.08)";
+    bg.setLineDash([4, 8]);
+    bg.lineWidth = 1;
+    for (let i = 1; i < LANES; i++) {
+      const ly = TOP_PAD + i * LANE_H;
+      bg.beginPath();
+      bg.moveTo(0, ly);
+      bg.lineTo(W, ly);
+      bg.stroke();
+    }
+  }
+
+  function spawnItem() {
+    const lane = Math.floor(Math.random() * LANES);
+    const isJollof = Math.random() < 0.65;
+    items.push({ x: W + 10, lane, w: 22, h: 22, type: isJollof ? "jollof" : "pepper" });
+  }
 
   function reset() {
     score = 0;
-    fallSpeed = 2.5;
+    speed = 4;
     frameCount = 0;
     items = [];
-    player.x = W / 2 - PLAYER_W / 2;
-    player.targetX = player.x;
+    player.lane = 1;
+    player.y = laneY(1);
     updateScore();
   }
 
@@ -60,29 +86,17 @@ const game = (() => {
     }
   }
 
-  function spawnItem() {
-    const size = 22;
-    const x = Math.random() * (W - size);
-    const isJollof = Math.random() < 0.6;
-    items.push({ x, y: -size, w: size, h: size, type: isJollof ? "jollof" : "pepper" });
-  }
-
   function drawPlayer() {
-    const px = player.x;
-    const py = playerY();
-    const cx = px + PLAYER_W / 2;
-    const cy = py + PLAYER_H / 2;
-    // Open mouth facing up
+    const cx = player.x + 13, cy = player.y + 13;
     ctx.fillStyle = "#22c55e";
     ctx.beginPath();
-    ctx.arc(cx, cy, PLAYER_W / 2, -Math.PI * 0.75, -Math.PI * 0.25, true);
+    ctx.arc(cx, cy, 13, 0.25, Math.PI * 2 - 0.25);
     ctx.lineTo(cx, cy);
     ctx.fill();
-    // Eye
     ctx.fillStyle = "#fff";
-    ctx.fillRect(cx - 3, cy - 8, 5, 5);
+    ctx.fillRect(cx + 2, cy - 7, 5, 5);
     ctx.fillStyle = "#000";
-    ctx.fillRect(cx - 2, cy - 7, 2.5, 2.5);
+    ctx.fillRect(cx + 4, cy - 6, 2.5, 2.5);
   }
 
   function drawJollof(x, y) {
@@ -108,75 +122,50 @@ const game = (() => {
     ctx.fillRect(x + 9, y - 2, 4, 6);
   }
 
-  function collides(ax, ay, aw, ah, bx, by, bw, bh) {
-    return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
+  function collides(px, py, pw, ph, ix, iy, iw, ih) {
+    return px < ix + iw && px + pw > ix && py < iy + ih && py + ph > iy;
   }
 
-  // Input state
-  let moveDir = 0; // -1 left, 0 none, 1 right
-  let keysDown = new Set();
-
-  function onKeyDown(e) {
-    if (!running) return;
-    if (e.key === "ArrowLeft" || e.key === "a") { e.preventDefault(); keysDown.add("left"); }
-    if (e.key === "ArrowRight" || e.key === "d") { e.preventDefault(); keysDown.add("right"); }
-    updateMoveDir();
+  function moveUp() {
+    if (running) player.lane = Math.max(0, player.lane - 1);
   }
-  function onKeyUp(e) {
-    if (e.key === "ArrowLeft" || e.key === "a") keysDown.delete("left");
-    if (e.key === "ArrowRight" || e.key === "d") keysDown.delete("right");
-    updateMoveDir();
-  }
-  function updateMoveDir() {
-    if (keysDown.has("left") && !keysDown.has("right")) moveDir = -1;
-    else if (keysDown.has("right") && !keysDown.has("left")) moveDir = 1;
-    else moveDir = 0;
+  function moveDown() {
+    if (running) player.lane = Math.min(LANES - 1, player.lane + 1);
   }
 
-  // Touch: tap left/right side of canvas to move, hold to keep moving
-  let touchHoldInterval = null;
-  function onTouchStart(e) {
+  function onKey(e) {
     if (!running) return;
-    e.preventDefault();
-    const rect = gameCanvas.getBoundingClientRect();
-    const touchX = e.touches[0].clientX - rect.left;
-    moveDir = touchX < rect.width / 2 ? -1 : 1;
-  }
-  function onTouchMove(e) {
-    if (!running) return;
-    const rect = gameCanvas.getBoundingClientRect();
-    const touchX = e.touches[0].clientX - rect.left;
-    moveDir = touchX < rect.width / 2 ? -1 : 1;
-  }
-  function onTouchEnd() {
-    moveDir = 0;
+    if (e.key === "ArrowUp" || e.key === "w") { e.preventDefault(); moveUp(); }
+    else if (e.key === "ArrowDown" || e.key === "s") { e.preventDefault(); moveDown(); }
   }
 
   function tick() {
     if (!running) return;
     frameCount++;
-    ctx.clearRect(0, 0, W, H);
 
-    // Move player
-    player.x += moveDir * MOVE_SPEED;
-    player.x = Math.max(0, Math.min(W - PLAYER_W, player.x));
+    ctx.clearRect(0, 0, W, H);
+    if (bgCanvas) ctx.drawImage(bgCanvas, 0, 0, W, H);
+
+    // Smooth player movement
+    const targetY = laneY(player.lane);
+    player.y += (targetY - player.y) * 0.3;
 
     drawPlayer();
 
     // Spawn
-    const spawnRate = Math.max(18, 45 - Math.floor(score / 5) * 2);
+    const spawnRate = Math.max(22, 50 - Math.floor(score / 5) * 2);
     if (frameCount % spawnRate === 0) spawnItem();
 
     // Update & draw items
-    const py = playerY();
     for (let i = items.length - 1; i >= 0; i--) {
       const it = items[i];
-      it.y += fallSpeed;
+      it.x -= speed;
+      const iy = laneY(it.lane);
 
-      if (it.type === "jollof") drawJollof(it.x, it.y);
-      else drawPepper(it.x, it.y);
+      if (it.type === "jollof") drawJollof(it.x, iy);
+      else drawPepper(it.x, iy);
 
-      if (collides(player.x, py, PLAYER_W, PLAYER_H, it.x, it.y, it.w, it.h)) {
+      if (collides(player.x, player.y, player.w, player.h, it.x, iy, it.w, it.h)) {
         if (it.type === "jollof") {
           score++;
           flashColor = "rgba(249,115,22,";
@@ -190,29 +179,29 @@ const game = (() => {
         continue;
       }
 
-      // Remove if off screen (missed jollof doesn't penalize)
-      if (it.y > H + 10) items.splice(i, 1);
+      if (it.x + it.w < 0) items.splice(i, 1);
     }
 
-    // Flash overlay
     if (flashAlpha > 0.01) {
       ctx.fillStyle = flashColor + flashAlpha + ")";
       ctx.fillRect(0, 0, W, H);
       flashAlpha *= 0.85;
     }
 
-    fallSpeed = 2.5 + Math.floor(score / 6) * 0.4;
+    speed = 4 + Math.floor(score / 8) * 0.5;
     animFrame = requestAnimationFrame(tick);
   }
 
   return {
+    moveUp,
+    moveDown,
     start() {
       // Unhide FIRST so we can measure dimensions
       gameContainer.classList.remove("hidden");
 
       dpr = window.devicePixelRatio || 1;
       W = gameContainer.clientWidth - 20;
-      H = 150;
+      H = TOP_PAD + LANES * LANE_H + 8;
       gameCanvas.width = W * dpr;
       gameCanvas.height = H * dpr;
       gameCanvas.style.width = W + "px";
@@ -221,34 +210,41 @@ const game = (() => {
       ctx = gameCanvas.getContext("2d");
       ctx.scale(dpr, dpr);
 
+      buildBg();
       reset();
       running = true;
-      moveDir = 0;
-      keysDown.clear();
       gameContainer.scrollIntoView({ behavior: "smooth", block: "nearest" });
-      document.addEventListener("keydown", onKeyDown);
-      document.addEventListener("keyup", onKeyUp);
-      gameCanvas.addEventListener("touchstart", onTouchStart, { passive: false });
-      gameCanvas.addEventListener("touchmove", onTouchMove, { passive: false });
-      gameCanvas.addEventListener("touchend", onTouchEnd, { passive: true });
+      document.addEventListener("keydown", onKey);
       tick();
     },
     stop() {
       running = false;
       if (animFrame) cancelAnimationFrame(animFrame);
-      document.removeEventListener("keydown", onKeyDown);
-      document.removeEventListener("keyup", onKeyUp);
-      gameCanvas.removeEventListener("touchstart", onTouchStart);
-      gameCanvas.removeEventListener("touchmove", onTouchMove);
-      gameCanvas.removeEventListener("touchend", onTouchEnd);
-      moveDir = 0;
-      keysDown.clear();
+      document.removeEventListener("keydown", onKey);
       const finalScore = score;
       gameContainer.classList.add("hidden");
       return finalScore;
     },
   };
 })();
+
+// Wire up on-screen arrow buttons for mobile
+document.getElementById("btn-up")?.addEventListener("click", () => game.moveUp());
+document.getElementById("btn-down")?.addEventListener("click", () => game.moveDown());
+// Also support touch hold for repeated movement
+["btn-up", "btn-down"].forEach((id) => {
+  const btn = document.getElementById(id);
+  if (!btn) return;
+  let interval = null;
+  const action = id === "btn-up" ? () => game.moveUp() : () => game.moveDown();
+  btn.addEventListener("touchstart", (e) => {
+    e.preventDefault();
+    action();
+    interval = setInterval(action, 150);
+  }, { passive: false });
+  btn.addEventListener("touchend", () => { clearInterval(interval); interval = null; });
+  btn.addEventListener("touchcancel", () => { clearInterval(interval); interval = null; });
+});
 
 // ============================================================
 // Toggle wiring
@@ -278,10 +274,7 @@ speakBtn.addEventListener("click", async () => {
   status.className = "status";
   status.textContent = "";
 
-  // Determine what to synthesize
   let igboText = text;
-  // Also check if user manually typed Igbo in the right box
-  const manualIgbo = igboOutput.textContent.trim();
 
   try {
     // Step 1: Translate English → Igbo
