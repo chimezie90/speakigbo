@@ -279,12 +279,12 @@ audio {
 
 .game-play-area {
   display: flex;
+  flex-direction: column;
   gap: 8px;
-  align-items: center;
 }
 
 #game-canvas {
-  flex: 1;
+  width: 100%;
   display: block;
   border-radius: 6px;
   background: #12141c;
@@ -292,19 +292,18 @@ audio {
 
 .game-dpad {
   display: flex;
-  flex-direction: column;
-  gap: 6px;
-  flex-shrink: 0;
+  gap: 10px;
+  justify-content: center;
 }
 
 .dpad-btn {
-  width: 44px;
-  height: 44px;
+  width: 64px;
+  height: 48px;
   border-radius: 10px;
   border: 1px solid #3a3d45;
   background: #2a2d35;
   color: #e4e4e7;
-  font-size: 1.1rem;
+  font-size: 1.3rem;
   cursor: pointer;
   display: flex;
   align-items: center;
