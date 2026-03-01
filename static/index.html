@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>SpeakIgbo — Igbo Text-to-Speech</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main>
+    <h1>SpeakIgbo</h1>
+    <p class="subtitle">Type text. Hear it spoken in Igbo.</p>
+
+    <div class="text-pair">
+      <div class="text-box">
+        <label class="text-box-label">English</label>
+        <textarea id="text-input" rows="3" placeholder="Type English text here…" autofocus></textarea>
+      </div>
+      <div class="text-box">
+        <label class="text-box-label">Igbo</label>
+        <div id="igbo-output" class="igbo-output" contenteditable="true" data-placeholder="Igbo translation appears here…"></div>
+      </div>
+    </div>
+
+    <div class="controls">
+      <div class="toggle-group">
+        <label class="toggle-label">Voice</label>
+        <div class="toggle" id="voice-toggle">
+          <button class="toggle-btn active" data-value="female">Female</button>
+          <button class="toggle-btn" data-value="male">Male</button>
+        </div>
+      </div>
+    </div>
+
+    <button id="speak-btn" class="speak-btn">Speak</button>
+
+    <div id="status" class="status"></div>
+
+    <audio id="audio-player" controls class="hidden"></audio>
+
+    <div id="game-container" class="game-container hidden">
+      <div class="game-header">
+        <span class="game-title">Eat the Jollof!</span>
+        <span class="game-score-wrap">Score: <strong id="game-score">0</strong> | Best: <strong id="game-best">0</strong></span>
+      </div>
+      <p class="game-hint">← → keys or tap left/right to move</p>
+      <canvas id="game-canvas"></canvas>
+    </div>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>
