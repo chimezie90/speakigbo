@@ -284,10 +284,10 @@ audio {
 }
 
 #game-canvas {
-  width: 100%;
   display: block;
   border-radius: 6px;
   background: #12141c;
+  max-width: 100%;
 }
 
 .game-dpad {
