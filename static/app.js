@@ -208,7 +208,7 @@ const game = (() => {
       gameCanvas.style.height = H + "px";
 
       ctx = gameCanvas.getContext("2d");
-      ctx.scale(dpr, dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
       buildBg();
       reset();
