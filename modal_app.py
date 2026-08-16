@@ -389,6 +389,16 @@ def web():
     # --- FastAPI ---
     api = FastAPI(title="SpeakIgbo")
 
+    # goodbye.html (uninstall survey) posts to /api/event from the vercel site;
+    # browser pages need CORS, unlike the extensions (host_permissions bypass it).
+    from fastapi.middleware.cors import CORSMiddleware
+    api.add_middleware(
+        CORSMiddleware,
+        allow_origins=["https://igbo-keyboard.vercel.app"],
+        allow_methods=["POST"],
+        allow_headers=["Content-Type"],
+    )
+
     class TranslateRequest(BaseModel):
         text: str
 
