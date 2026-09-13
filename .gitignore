@@ -4,3 +4,5 @@ __pycache__/
 *.pt
 .claude/
 .context/
+data/
+subscribers.csv

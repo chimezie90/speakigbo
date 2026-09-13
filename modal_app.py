@@ -4,6 +4,8 @@ CPU container: serves static files + translation (NLLB-200) — fast cold start 
 GPU container: TTS synthesis (F5-TTS) — cold start hidden behind game time
 """
 
+import time
+
 import modal
 from pathlib import Path
 
@@ -19,6 +21,12 @@ rate_dict = modal.Dict.from_name("speakigbo-ratelimit", create_if_missing=True)
 # Anonymous usage counters (telemetry) and the opt-in marketing list.
 events_dict = modal.Dict.from_name("speakigbo-events", create_if_missing=True)
 subscribers_dict = modal.Dict.from_name("speakigbo-subscribers", create_if_missing=True)
+
+# Durable append-only log for signups + events. Modal Dict entries expire after
+# 7 days of inactivity (this silently deleted 5 signups in Sept 2026), so the
+# Dicts above are only a hot cache — the Volume is the source of truth.
+data_volume = modal.Volume.from_name("speakigbo-data", create_if_missing=True)
+DATA_DIR = "/data"
 
 # Beta usage caps — tune freely.
 PER_IP_DAILY_CALLS = 150    # translate + synth calls per client IP per day
@@ -239,11 +247,14 @@ class TTSModel:
     timeout=120,
     scaledown_window=300,
     secrets=[modal.Secret.from_name("speakigbo-beta")],
+    volumes={DATA_DIR: data_volume},
 )
 @modal.concurrent(max_inputs=10)
 @modal.asgi_app()
 def web():
+    import asyncio
     import datetime
+    import json
     import logging
     import os
     import re
@@ -424,6 +435,56 @@ def web():
         product: str = ""
         source: str = ""
 
+    # One log file per container per day so concurrent containers never write
+    # the same Volume file (Volumes are last-commit-wins per file).
+    import hashlib
+    import uuid
+    _log_id = (os.environ.get("MODAL_TASK_ID") or uuid.uuid4().hex)[-12:]
+    _client_salt = os.environ.get("BETA_KEY", "")
+
+    _pending = {"dirty": False}
+
+    async def _append_log(kind: str, record: dict, commit_now: bool = True) -> bool:
+        """Append one record to the durable log. Returns False on failure.
+
+        A Volume commit costs ~3s, so signups commit immediately (they matter)
+        and events only mark the log dirty; _flush_loop commits them in batches.
+        """
+        try:
+            d = os.path.join(DATA_DIR, kind)
+            os.makedirs(d, exist_ok=True)
+            # File is closed before any await so the commit never sees an open handle.
+            with open(os.path.join(d, f"{_today()}-{_log_id}.jsonl"), "a") as f:
+                f.write(json.dumps(record, separators=(",", ":")) + "\n")
+            if commit_now:
+                await data_volume.commit.aio()  # async so it does not block other requests
+                _pending["dirty"] = False
+            else:
+                _pending["dirty"] = True
+            return True
+        except Exception as e:
+            logger.error(f"durable log append failed ({kind}): {e}")
+            return False
+
+    async def _flush_loop():
+        while True:
+            await asyncio.sleep(5)
+            if _pending["dirty"]:
+                _pending["dirty"] = False
+                try:
+                    await data_volume.commit.aio()
+                except Exception as e:
+                    _pending["dirty"] = True
+                    logger.error(f"durable log flush failed: {e}")
+
+    @api.on_event("startup")
+    async def _start_flush():
+        asyncio.create_task(_flush_loop())
+
+    def _daily_client_hash(client_id: str, today: str) -> str:
+        # Stable only within one day: enough for DAU dedup, useless for tracking.
+        return hashlib.sha256(f"{today}:{_client_salt}:{client_id}".encode()).hexdigest()[:16]
+
     def _light_limit(request: Request, bucket: str, cap: int):
         """Per-IP daily cap for the open (no-key) endpoints — cheap abuse guard."""
         today = _today()
@@ -503,6 +564,11 @@ def web():
                 events_dict[seen] = 1
                 dau = f"dau:{today}:{product}"
                 events_dict[dau] = events_dict.get(dau, 0) + 1
+        await _append_log("events", commit_now=False, record={
+            "ts": round(time.time(), 3), "day": today, "product": product,
+            "event": ev,
+            "client": _daily_client_hash(req.clientId[:64], today) if req.clientId else "",
+        })
         return {"ok": True}
 
     @api.post("/api/warmup")
@@ -528,17 +594,40 @@ def web():
             raise HTTPException(status_code=400, detail="Invalid phone number.")
         key = f"sub:{email or phone}"
         existing = subscribers_dict.get(key)
-        subscribers_dict[key] = {
+        record = {
             "email": email,
             "phone": phone,
             "product": (req.product or "")[:20],
             "source": (req.source or "")[:40],
             "ts": existing.get("ts") if existing else time.time(),
         }
+        if not await _append_log("subscribers", record):
+            raise HTTPException(status_code=503, detail="Please try again in a moment.")
+        subscribers_dict[key] = record
         return {"ok": True}
 
     api.mount("/", StaticFiles(directory="/app/static", html=True), name="static")
     return api
+
+
+def _read_log(kind: str):
+    """Yield every record in the durable Volume log for `kind` (subscribers|events)."""
+    import json
+    try:
+        entries = list(data_volume.listdir(f"/{kind}"))
+    except (FileNotFoundError, modal.exception.NotFoundError):
+        return  # log dir not created yet; any other error should surface
+    for e in sorted(entries, key=lambda e: e.path):
+        if not e.path.endswith(".jsonl"):
+            continue
+        buf = b"".join(data_volume.read_file(e.path))
+        for line in buf.decode("utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if line:
+                try:
+                    yield json.loads(line)
+                except ValueError:
+                    pass
 
 
 @app.local_entrypoint()
@@ -552,10 +641,28 @@ def export_subscribers():
         s = str(val)
         return "'" + s if s[:1] in ("=", "+", "-", "@") else s
 
+    # Durable log is the source of truth; the Dict only adds anything written
+    # in the last 7 days that predates the log. Dedup on email-or-phone, keep
+    # the earliest signup time.
     subs = modal.Dict.from_name("speakigbo-subscribers", create_if_missing=True)
-    rows = [v for _, v in subs.items()]
-    rows.sort(key=lambda r: r.get("ts", 0))
-    out = "subscribers.csv"
+    merged, deleted = {}, {}
+    for r in list(_read_log("subscribers")) + [v for _, v in subs.items()]:
+        k = r.get("email") or r.get("phone")
+        if not k or r.get("product") == "verify" or r.get("source") == "verify":
+            continue  # skip endpoint-verification test rows
+        if r.get("deleted"):
+            deleted[k] = max(deleted.get(k, 0), r.get("ts", 0))
+            continue
+        if k not in merged or r.get("ts", 0) < merged[k].get("ts", 0):
+            merged[k] = r
+    # A tombstone removes the contact unless they signed up again after it.
+    rows = sorted(
+        (r for k, r in merged.items() if deleted.get(k, -1) < r.get("ts", 0) or k not in deleted),
+        key=lambda r: r.get("ts", 0),
+    )
+    import os
+    os.makedirs("data", exist_ok=True)
+    out = "data/subscribers.csv"  # data/ is gitignored — never write PII to the repo root
     with open(out, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["email", "phone", "product", "source", "ts"])
         w.writeheader()
@@ -566,7 +673,27 @@ def export_subscribers():
 
 @app.local_entrypoint()
 def stats():
-    """Print usage counters. Run: modal run modal_app.py::stats"""
+    """Print usage counters. Run: modal run modal_app.py::stats
+
+    First block: rebuilt from the durable Volume log (complete since it was
+    added). Second block: the Dict cache (only the last 7 days survive there).
+    """
+    from collections import Counter
+
+    ct, dau_seen = Counter(), set()
+    for r in _read_log("events"):
+        p, ev, day = r.get("product", "?"), r.get("event", "?"), r.get("day", "?")
+        ct[f"ct:{p}:{ev}"] += 1
+        ct[f"ct:{day}:{p}:{ev}"] += 1
+        if r.get("client"):
+            dau_seen.add((day, p, r["client"]))
+    for day, p, _ in dau_seen:
+        ct[f"dau:{day}:{p}"] += 1
+    print("# durable log (Volume speakigbo-data)")
+    for k in sorted(ct):
+        print(f"{k}\t{ct[k]}")
+
+    print("# dict cache (entries expire after 7 idle days)")
     events = modal.Dict.from_name("speakigbo-events", create_if_missing=True)
     interesting = sorted(
         (k, v) for k, v in events.items()
@@ -574,6 +701,52 @@ def stats():
     )
     for k, v in interesting:
         print(f"{k}\t{v}")
+
+
+@app.local_entrypoint()
+def seed_subscribers(csv_path: str = "data/subscribers-backup.csv"):
+    """One-off: load a local CSV (email,phone,product,source,ts) into the durable log.
+    Run: modal run modal_app.py::seed_subscribers"""
+    import csv
+    import io
+    import json
+
+    lines = []
+    with open(csv_path, newline="") as f:
+        for r in csv.DictReader(f):
+            # Undo the CSV-injection quote the exporter adds to leading = + - @
+            f_ = {k: (r.get(k) or "").strip().lstrip("'") for k in ("email", "phone", "product", "source", "ts")}
+            email, phone = f_["email"].lower(), f_["phone"]
+            if (not email and not phone) or not f_["ts"]:
+                continue  # no contact, or no signup time (would win dedup as ts=0)
+            lines.append(json.dumps({
+                "email": email, "phone": phone,
+                "product": f_["product"][:20], "source": f_["source"][:40],
+                "ts": float(f_["ts"]),
+            }, separators=(",", ":")))
+    payload = ("\n".join(lines) + "\n").encode()
+    name = f"/subscribers/seed-{int(time.time())}.jsonl"  # never overwrite an earlier seed
+    with data_volume.batch_upload() as batch:
+        batch.put_file(io.BytesIO(payload), name)
+    print(f"Seeded {len(lines)} subscriber rows into the durable log ({name})")
+
+
+@app.local_entrypoint()
+def remove_subscriber(contact: str):
+    """Write a tombstone so `contact` (email or phone) is dropped from future exports.
+    Run: modal run modal_app.py::remove_subscriber --contact someone@example.com"""
+    import io
+    import json
+
+    contact = contact.strip().lower()
+    rec = {"email": contact if "@" in contact else "", "phone": "" if "@" in contact else contact,
+           "deleted": True, "ts": time.time()}
+    with data_volume.batch_upload() as batch:
+        batch.put_file(io.BytesIO((json.dumps(rec) + "\n").encode()),
+                       f"/subscribers/tombstone-{int(time.time())}.jsonl")
+    subs = modal.Dict.from_name("speakigbo-subscribers", create_if_missing=True)
+    subs.pop(f"sub:{contact}", None)
+    print(f"Removed {contact}")
 
 
 @app.local_entrypoint()
