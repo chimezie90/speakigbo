@@ -1,7 +1,10 @@
 """SpeakIgbo — Modal deployment with split CPU/GPU inference.
 
-CPU container: serves static files + translation (NLLB-200) — fast cold start ~10s
-GPU container: TTS synthesis (F5-TTS) — cold start hidden behind game time
+CPU container: serves static files + translation (NLLB-200, baked into the
+    image at build time — see _bake_nllb)
+GPU: two separate classes so the reader's cold start never pays for a model
+    it doesn't use — TTSModel (synthesize + warmup, what the reader calls)
+    and ASRModel (transcribe, used only by speakigbo.com's voice-mode page)
 """
 
 import time
@@ -38,6 +41,18 @@ MAX_CONTACT_CHARS = 200     # email/phone length cap on the subscribe list
 
 # --- Images ---
 
+def _bake_nllb():
+    # Runs once at image build time so the 600M-param NLLB weights are baked
+    # into the image layer. Before this (found 2026-09-15 via `modal app logs`
+    # + `modal billing report`), every CPU cold start re-downloaded the full
+    # model from the HF hub — visible live as a fresh "Loading weights: 100%"
+    # on every scale-up, adding both latency and bandwidth cost to a container
+    # that scales to zero after 5 idle minutes.
+    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+    AutoTokenizer.from_pretrained("facebook/nllb-200-distilled-600M")
+    AutoModelForSeq2SeqLM.from_pretrained("facebook/nllb-200-distilled-600M")
+
+
 # Lightweight CPU image for translation + static serving
 cpu_image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -47,7 +62,7 @@ cpu_image = (
         "sentencepiece",
         "torch",
     )
-    .run_commands("echo 'v6-faster-female'")
+    .run_function(_bake_nllb)
     .add_local_dir(Path(__file__).parent / "static", remote_path="/app/static")
 )
 
@@ -71,6 +86,15 @@ gpu_image = (
 
 
 # --- GPU class: TTS synthesis with persistent model loading ---
+#
+# Split from ASR into two containers (2026-09-15). Before this, every cold
+# start of the shared class — including a bare /api/warmup with no synth —
+# pulled a full 1B-parameter MMS ASR model from the HF hub and built a KenLM
+# beam decoder, neither of which the reader (translate/synthesize/warmup)
+# ever uses. `modal billing report` showed that churn was most of speakigbo's
+# cost even though actual synth calls were rare. The reader now only ever
+# touches this lean TTS-only class; ASRModel below serves /api/transcribe,
+# used only by the speakigbo.com voice-mode page.
 
 @app.cls(
     image=gpu_image,
@@ -102,7 +126,70 @@ class TTSModel:
         )
         self.logger.info("F5-TTS ready.")
 
-        # --- ASR model (MMS-1B + v7 adapter) ---
+        self.ref_audio = {
+            "female": {
+                "path": "/app/ref_audio/female_1.wav",
+                "text": "O doro anya na nke a bụ ihe na-adọrọ mmasị ọtụtụ n'ịme emume Eucharist.",
+            },
+            "male": {
+                "path": "/app/ref_audio/male_1.wav",
+                "text": "Ọbịbịa ya na-agwaghị onye ọbụla wetara ajụjụ karịa ọsịsa na njikọ ha nke dịkwa mfe ịgbaji.",
+            },
+        }
+
+    @modal.method()
+    def synthesize(self, igbo_text: str, voice: str = "female") -> dict:
+        import base64
+        import io
+        import time
+        import soundfile as sf
+
+        ref = self.ref_audio.get(voice, self.ref_audio["female"])
+
+        t0 = time.time()
+        wav, sr, _ = self.f5tts.infer(
+            ref_file=ref["path"], ref_text=ref["text"],
+            gen_text=igbo_text, nfe_step=self.nfe_steps,
+        )
+        t1 = time.time()
+
+        buf = io.BytesIO()
+        sf.write(buf, wav, sr, format="WAV")
+        buf.seek(0)
+        audio_b64 = base64.b64encode(buf.read()).decode()
+
+        self.logger.info(f"Synthesis: {t1-t0:.2f}s ({self.nfe_steps} steps, {len(wav)/sr:.1f}s audio)")
+        return {"audio": audio_b64}
+
+    @modal.method()
+    def warmup(self) -> dict:
+        # No inference. @modal.enter already loaded the model when the container
+        # started; invoking this via .spawn() just ensures a warm container
+        # exists so the next real synth skips cold start.
+        return {"ready": True}
+
+
+# --- GPU class: ASR only, used by speakigbo.com's /api/transcribe. The
+# reader never calls this, so its cold start never blocks a read. ---
+
+@app.cls(
+    image=gpu_image,
+    gpu="T4",
+    volumes={"/models": volume},
+    timeout=120,
+    scaledown_window=300,
+)
+@modal.concurrent(max_inputs=4)
+class ASRModel:
+    @modal.enter()
+    def load_model(self):
+        import logging
+        import torch
+
+        logging.basicConfig(level=logging.INFO)
+        self.logger = logging.getLogger(__name__)
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+
         self.logger.info("Loading ASR model (MMS-1B + v7 adapter)...")
         from safetensors.torch import load_file as safe_load_file
         from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
@@ -148,48 +235,6 @@ class TTSModel:
         else:
             self.logger.info("KenLM not found, using greedy decoding.")
 
-        self.ref_audio = {
-            "female": {
-                "path": "/app/ref_audio/female_1.wav",
-                "text": "O doro anya na nke a bụ ihe na-adọrọ mmasị ọtụtụ n'ịme emume Eucharist.",
-            },
-            "male": {
-                "path": "/app/ref_audio/male_1.wav",
-                "text": "Ọbịbịa ya na-agwaghị onye ọbụla wetara ajụjụ karịa ọsịsa na njikọ ha nke dịkwa mfe ịgbaji.",
-            },
-        }
-
-    @modal.method()
-    def synthesize(self, igbo_text: str, voice: str = "female") -> dict:
-        import base64
-        import io
-        import time
-        import soundfile as sf
-
-        ref = self.ref_audio.get(voice, self.ref_audio["female"])
-
-        t0 = time.time()
-        wav, sr, _ = self.f5tts.infer(
-            ref_file=ref["path"], ref_text=ref["text"],
-            gen_text=igbo_text, nfe_step=self.nfe_steps,
-        )
-        t1 = time.time()
-
-        buf = io.BytesIO()
-        sf.write(buf, wav, sr, format="WAV")
-        buf.seek(0)
-        audio_b64 = base64.b64encode(buf.read()).decode()
-
-        self.logger.info(f"Synthesis: {t1-t0:.2f}s ({self.nfe_steps} steps, {len(wav)/sr:.1f}s audio)")
-        return {"audio": audio_b64}
-
-    @modal.method()
-    def warmup(self) -> dict:
-        # No inference. @modal.enter already loaded the model when the container
-        # started; invoking this via .spawn() just ensures a warm container
-        # exists so the next real synth skips cold start.
-        return {"ready": True}
-
     @modal.method()
     def transcribe(self, audio_b64: str) -> dict:
         import base64
@@ -197,7 +242,6 @@ class TTSModel:
         import time
 
         import librosa
-        import numpy as np
         import soundfile as sf
         import torch
 
@@ -354,8 +398,9 @@ def web():
             return _nllb_translate(normalized)
         return " ".join(_nllb_translate(s) for s in sentences)
 
-    # Reference to GPU TTS class
+    # Reference to GPU classes (split 2026-09-15 — see class comments above)
     tts_model = TTSModel()
+    asr_model = ASRModel()
 
     # --- Beta gating: access key + rate limits ---
     BETA_KEY = os.environ.get("BETA_KEY", "")
@@ -523,7 +568,7 @@ def web():
         if not req.audio:
             raise HTTPException(status_code=400, detail="Audio data is required")
         _gate(request, gpu=True)
-        result = tts_model.transcribe.remote(req.audio)
+        result = asr_model.transcribe.remote(req.audio)
         return result
 
     @api.post("/api/translate-to-english")
@@ -573,10 +618,26 @@ def web():
 
     @api.post("/api/warmup")
     async def warmup_route(request: Request):
-        # Spins up / keeps a GPU container warm WITHOUT running a synth, so the
-        # first real read skips cold start. Fire-and-forget; does not count
-        # against the synth budget.
-        _light_limit(request, "warmup", 200)
+        # Spins up / keeps the TTS-only GPU container warm WITHOUT running a
+        # synth, so a real read skips cold start. Fire-and-forget; does not
+        # count against the synth budget (gpu=False).
+        #
+        # Now requires the beta key (2026-09-15, code review finding): this
+        # route used to skip _gate() entirely, so it took no key and had no
+        # global cap — anyone, from any number of rotating IPs, could spin a
+        # real T4 cold start for free, which defeats the whole point of the
+        # cap below (a per-IP limit is not a limit against a botnet). _gate()
+        # also folds in the shared per-IP daily cap; _light_limit below is an
+        # extra, warmup-specific ceiling on top of that.
+        #
+        # Cap lowered 200 -> 30/IP/day (2026-09-15): this used to fire on every
+        # article-shaped page load (client-side, ~20-50 calls/day total across
+        # a handful of users) rather than on read intent, and each call cost a
+        # real T4 cold start. The extension now only calls this from an actual
+        # "Read in Igbo" click, so legitimate volume should be far under 30;
+        # this cap is a defense-in-depth ceiling, not the primary control.
+        _gate(request)
+        _light_limit(request, "warmup", 30)
         tts_model.warmup.spawn()
         return {"ok": True}
 
