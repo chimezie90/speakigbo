@@ -38,6 +38,11 @@ MAX_SYNTH_CHARS = 500       # per synth request — bounds GPU-seconds per call
 MAX_TRANSLATE_CHARS = 3000  # per translate request
 MAX_SENTENCES = 40          # cap sentences translated per request (CPU bound)
 MAX_CONTACT_CHARS = 200     # email/phone length cap on the subscribe list
+# ~10M base64 chars ≈ 7.5MB raw ≈ ~4 minutes of 16-bit mono 16kHz audio before
+# resampling — generous for a voice-mode clip, bounded so a huge/malformed
+# upload can't drive unbounded GPU memory and inference time on ASRModel for
+# the cost of a single call against the daily budget.
+MAX_TRANSCRIBE_B64_CHARS = 10_000_000
 
 # --- Images ---
 
@@ -423,7 +428,22 @@ def web():
         #    rather than silently exposing the GPU endpoints to the open internet.
         if not BETA_KEY:
             raise HTTPException(status_code=503, detail="Service unavailable.")
-        if request.headers.get("x-beta-key") != BETA_KEY:
+        # Constant-time compare — a plain != leaks a timing signal an
+        # attacker could use to brute-force the key byte by byte. (The
+        # sibling mexkoy-igbotts-api project's admin_usage endpoint uses the
+        # same pattern; no such precedent exists in THIS file/repo before
+        # this change — corrected 2026-09-15 after a review caught the
+        # comment claiming otherwise, which was false.) Encode to latin-1
+        # bytes first, not compare as str:
+        # secrets.compare_digest(str, str) requires both operands to be
+        # ASCII-only and raises TypeError otherwise, and ASGI headers decode
+        # as latin-1 — so a header byte above 0x7F (attacker-sent or
+        # malformed) would 500 every gated endpoint instead of cleanly
+        # 401ing. Bytes comparison has no such restriction; latin-1 can
+        # round-trip any byte value a header could legally carry.
+        import secrets
+        supplied = (request.headers.get("x-beta-key") or "").encode("latin-1", errors="replace")
+        if not secrets.compare_digest(supplied, BETA_KEY.encode("latin-1")):
             raise HTTPException(status_code=401, detail="Beta access key required.")
         today = _today()
         # 2. Per-IP daily cap
@@ -567,6 +587,8 @@ def web():
     async def transcribe_audio(req: TranscribeRequest, request: Request):
         if not req.audio:
             raise HTTPException(status_code=400, detail="Audio data is required")
+        if len(req.audio) > MAX_TRANSCRIBE_B64_CHARS:
+            raise HTTPException(status_code=400, detail="Audio too long (max ~4 minutes).")
         _gate(request, gpu=True)
         result = asr_model.transcribe.remote(req.audio)
         return result
@@ -704,9 +726,9 @@ def export_subscribers():
 
     # Durable log is the source of truth; the Dict only adds anything written
     # in the last 7 days that predates the log. Dedup on email-or-phone, keep
-    # the earliest signup time.
+    # the earliest signup record for export fields ("first seen" attribution).
     subs = modal.Dict.from_name("speakigbo-subscribers", create_if_missing=True)
-    merged, deleted = {}, {}
+    merged, deleted, latest_signup_ts = {}, {}, {}
     for r in list(_read_log("subscribers")) + [v for _, v in subs.items()]:
         k = r.get("email") or r.get("phone")
         if not k or r.get("product") == "verify" or r.get("source") == "verify":
@@ -714,11 +736,19 @@ def export_subscribers():
         if r.get("deleted"):
             deleted[k] = max(deleted.get(k, 0), r.get("ts", 0))
             continue
-        if k not in merged or r.get("ts", 0) < merged[k].get("ts", 0):
+        ts = r.get("ts", 0)
+        latest_signup_ts[k] = max(latest_signup_ts.get(k, 0), ts)
+        if k not in merged or ts < merged[k].get("ts", 0):
             merged[k] = r
     # A tombstone removes the contact unless they signed up again after it.
+    # Bug fixed 2026-09-15: this used to compare the tombstone against
+    # merged[k]'s ts — but merged[k] is deliberately the EARLIEST signup, so
+    # a resubscribe (a later signup row, never the one kept in merged) could
+    # never win against its own later tombstone. Compare against
+    # latest_signup_ts instead, which tracks the most recent signup per
+    # contact regardless of which record merged[k] kept for its fields.
     rows = sorted(
-        (r for k, r in merged.items() if deleted.get(k, -1) < r.get("ts", 0) or k not in deleted),
+        (r for k, r in merged.items() if deleted.get(k, -1) < latest_signup_ts.get(k, 0)),
         key=lambda r: r.get("ts", 0),
     )
     import os
@@ -825,35 +855,50 @@ def upload_models():
     asr_dir = os.path.join(igbotts, "asr_checkpoints/v7")
     kenlm_file = os.path.join(igbotts, "asr_checkpoints/kenlm/igbo_5gram.bin")
 
-    # Check what's already on the volume
-    entries = list(volume.listdir("/"))
-    existing = {e.path for e in entries}
-    print(f"Existing files in volume: {existing}")
+    # Recursive listing with real per-file sizes (fixed 2026-09-15, 2nd
+    # review pass: the previous version used a top-level-only listing, so
+    # "is this filename present" was the only check available — it couldn't
+    # tell a stale checkpoint from a fresh one (a retrain would silently
+    # never re-upload), and inside asr_v7/kenlm it could only see whether
+    # the DIRECTORY existed, not whether every file in it actually landed
+    # (an interrupted prior upload would read as "already there").
+    # Size-based comparison isn't a full content hash — same-size-different-
+    # content still false-skips — but it catches both cases above at the
+    # cost of one extra API call, which a manual, rarely-run operator script
+    # can afford.
+    existing_size = {e.path: e.size for e in volume.listdir("/", recursive=True) if e.type == 1}
+    print(f"{len(existing_size)} files already on volume.")
+
+    def _upload_if_changed(batch, local_path: str, remote_path: str, label: str) -> None:
+        remote_size = existing_size.get(remote_path)
+        if not os.path.isfile(local_path):
+            if remote_size is None:
+                print(f"  WARNING: {local_path} not found locally and {remote_path} not on volume!")
+            else:
+                print(f"  {label} not found locally; leaving the volume's copy ({remote_size//1024//1024}MB) as is.")
+            return
+        local_size = os.path.getsize(local_path)
+        if remote_size == local_size:
+            print(f"  {label} already on volume and same size ({local_size//1024//1024}MB), skipping.")
+            return
+        batch.put_file(local_path, remote_path)
+        verb = "Uploaded" if remote_size is None else f"Re-uploaded (size changed {remote_size}->{local_size} bytes)"
+        print(f"  {verb} {label} ({local_size//1024//1024}MB)")
 
     print("Uploading models to Modal volume...")
     with volume.batch_upload(force=True) as batch:
-        # TTS (skip if already uploaded)
-        if os.path.isfile(checkpoint):
-            batch.put_file(checkpoint, "igbo_tts_f5_wrapped.pt")
-            print(f"  igbo_tts_f5_wrapped.pt ({os.path.getsize(checkpoint)//1024//1024}MB)")
-        elif "igbo_tts_f5_wrapped.pt" not in existing:
-            print("  WARNING: TTS checkpoint not found locally and not on volume!")
+        _upload_if_changed(batch, checkpoint, "igbo_tts_f5_wrapped.pt", "igbo_tts_f5_wrapped.pt")
+        _upload_if_changed(batch, vocab, "vocab.txt", "vocab.txt")
+
+        if os.path.isdir(asr_dir):
+            for fname in os.listdir(asr_dir):
+                fpath = os.path.join(asr_dir, fname)
+                if os.path.isfile(fpath):
+                    _upload_if_changed(batch, fpath, f"asr_v7/{fname}", f"asr_v7/{fname}")
+        elif not any(p.startswith("asr_v7/") for p in existing_size):
+            print(f"  WARNING: {asr_dir} not found locally and no asr_v7/ files on volume!")
         else:
-            print("  TTS checkpoint already on volume, skipping.")
+            print("  asr_v7/ not found locally; leaving the volume's copy as is.")
 
-        if os.path.isfile(vocab):
-            batch.put_file(vocab, "vocab.txt")
-        elif "vocab.txt" not in existing:
-            print("  WARNING: vocab.txt not found locally and not on volume!")
-
-        # ASR v7 adapter
-        for fname in os.listdir(asr_dir):
-            fpath = os.path.join(asr_dir, fname)
-            if os.path.isfile(fpath):
-                batch.put_file(fpath, f"asr_v7/{fname}")
-                print(f"  asr_v7/{fname} ({os.path.getsize(fpath)//1024}KB)")
-
-        # KenLM
-        batch.put_file(kenlm_file, "kenlm/igbo_5gram.bin")
-        print(f"  kenlm/igbo_5gram.bin ({os.path.getsize(kenlm_file)//1024//1024}MB)")
+        _upload_if_changed(batch, kenlm_file, "kenlm/igbo_5gram.bin", "kenlm/igbo_5gram.bin")
     print("Done! Now deploy with: modal deploy modal_app.py")
