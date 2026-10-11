@@ -38,6 +38,8 @@ MAX_SYNTH_CHARS = 500       # per synth request — bounds GPU-seconds per call
 MAX_TRANSLATE_CHARS = 3000  # per translate request
 MAX_SENTENCES = 40          # cap sentences translated per request (CPU bound)
 MAX_CONTACT_CHARS = 200     # email/phone length cap on the subscribe list
+MAX_REPORT_CHARS = 300      # per text field on a mistake report
+REPORTS_PER_DAY = 2000      # global ceiling on mistake reports/day (storage-growth breaker)
 # ~10M base64 chars ≈ 7.5MB raw ≈ ~4 minutes of 16-bit mono 16kHz audio before
 # resampling — generous for a voice-mode clip, bounded so a huge/malformed
 # upload can't drive unbounded GPU memory and inference time on ASRModel for
@@ -500,6 +502,18 @@ def web():
         product: str = ""
         source: str = ""
 
+    class ReportRequest(BaseModel):
+        # A user-initiated mistake report. Unlike /api/event this carries text the
+        # user chose to send: what they typed, what the keyboard showed, their fix.
+        product: str = ""
+        kind: str = ""        # wrong_translation | wrong_tones | missing_word | other
+        typed: str = ""       # what the user typed (English or Igbo)
+        shown: str = ""       # what the keyboard suggested
+        correct: str = ""     # what it should be, if the user knows
+        comment: str = ""
+        contact: str = ""     # optional email/phone for follow-up
+        version: str = ""
+
     # One log file per container per day so concurrent containers never write
     # the same Volume file (Volumes are last-commit-wins per file).
     import hashlib
@@ -689,6 +703,35 @@ def web():
         subscribers_dict[key] = record
         return {"ok": True}
 
+    @api.post("/api/report")
+    async def report(req: ReportRequest, request: Request):
+        # Open endpoint, like /api/event and /api/subscribe: the keyboards send no beta key.
+        # Durable log only, no Dict cache: reports are read in bulk by export_reports.
+        kinds = {"wrong_translation", "wrong_tones", "missing_word", "other"}
+        record = {
+            "ts": round(time.time(), 3),
+            "product": (req.product or "")[:20],
+            "kind": req.kind if req.kind in kinds else "other",
+            "typed": req.typed.strip()[:MAX_REPORT_CHARS],
+            "shown": req.shown.strip()[:MAX_REPORT_CHARS],
+            "correct": req.correct.strip()[:MAX_REPORT_CHARS],
+            "comment": req.comment.strip()[:MAX_REPORT_CHARS],
+            "contact": req.contact.strip()[:MAX_CONTACT_CHARS],
+            "version": (req.version or "")[:20],
+        }
+        if not (record["typed"] or record["shown"] or record["correct"] or record["comment"]):
+            raise HTTPException(status_code=400, detail="Tell us what went wrong.")
+        # Validate before spending quota: Nigerian carrier NAT puts many users on one IP.
+        _light_limit(request, "report", 50)
+        # Global ceiling bounds Volume growth when the per-IP cap is sidestepped (IPv6, botnets).
+        gkey = f"lim:{_today()}:report:all"
+        if events_dict.get(gkey, 0) >= REPORTS_PER_DAY:
+            raise HTTPException(status_code=429, detail="Too many requests today.")
+        events_dict[gkey] = events_dict.get(gkey, 0) + 1
+        if not await _append_log("reports", record):
+            raise HTTPException(status_code=503, detail="Please try again in a moment.")
+        return {"ok": True}
+
     api.mount("/", StaticFiles(directory="/app/static", html=True), name="static")
     return api
 
@@ -760,6 +803,28 @@ def export_subscribers():
         for r in rows:
             w.writerow({k: _safe(r.get(k, "")) for k in w.fieldnames})
     print(f"Wrote {len(rows)} subscribers to {out}")
+
+
+@app.local_entrypoint()
+def export_reports():
+    """Export keyboard mistake reports to CSV. Run: modal run modal_app.py::export_reports"""
+    import csv
+    import os
+
+    def _safe(val):
+        s = str(val)
+        return "'" + s if s[:1] in ("=", "+", "-", "@") else s
+
+    rows = sorted((r for r in _read_log("reports") if r.get("product") != "verify"), key=lambda r: r.get("ts", 0))
+    os.makedirs("data", exist_ok=True)
+    out = "data/reports.csv"  # data/ is gitignored — reports can hold contact details
+    fields = ["ts", "product", "kind", "typed", "shown", "correct", "comment", "contact", "version"]
+    with open(out, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: _safe(r.get(k, "")) for k in fields})
+    print(f"Wrote {len(rows)} reports to {out}")
 
 
 @app.local_entrypoint()
