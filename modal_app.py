@@ -672,9 +672,15 @@ def web():
         # real T4 cold start. The extension now only calls this from an actual
         # "Read in Igbo" click, so legitimate volume should be far under 30;
         # this cap is a defense-in-depth ceiling, not the primary control.
+        #
+        # Spawn DISABLED (2026-10-12): the client fix above never reached the
+        # Chrome Web Store, so installed readers (1.1.1) still call this on
+        # every article-shaped page — ~45/day in Oct, each holding a T4 for the
+        # 300s scaledown, ~$2/day, the whole speakigbo bill. Kept as a no-op so
+        # old clients get 200 and the per-IP counter still records the volume.
+        # Re-enable once the read-intent reader build is published and adopted.
         _gate(request)
         _light_limit(request, "warmup", 30)
-        tts_model.warmup.spawn()
         return {"ok": True}
 
     @api.post("/api/subscribe")
