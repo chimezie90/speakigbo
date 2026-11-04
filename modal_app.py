@@ -1,12 +1,13 @@
 """SpeakIgbo — Modal deployment with split CPU/GPU inference.
 
-CPU container: serves static files + translation (NLLB-200, baked into the
-    image at build time — see _bake_nllb)
+Web container: static files, pings, sign-ups, reports. No torch, so it wakes in seconds.
+Translator (CPU): NLLB-200, baked into its image at build time — see _bake_nllb
 GPU: two separate classes so the reader's cold start never pays for a model
     it doesn't use — TTSModel (synthesize + warmup, what the reader calls)
     and ASRModel (transcribe, used only by speakigbo.com's voice-mode page)
 """
 
+import re
 import time
 
 import modal
@@ -60,17 +61,23 @@ def _bake_nllb():
     AutoModelForSeq2SeqLM.from_pretrained("facebook/nllb-200-distilled-600M")
 
 
-# Lightweight CPU image for translation + static serving
+# Web image: no torch or model (split 2026-11-04). The web container used to load NLLB at
+# start-up, so every ping, sign-up and report that woke it waited ~22 s for a model it never used.
+web_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .pip_install("fastapi>=0.110.0")
+    .add_local_dir(Path(__file__).parent / "static", remote_path="/app/static")
+)
+
+# CPU image for translation only
 cpu_image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(
-        "fastapi>=0.110.0",
         "transformers",
         "sentencepiece",
         "torch",
     )
     .run_function(_bake_nllb)
-    .add_local_dir(Path(__file__).parent / "static", remote_path="/app/static")
 )
 
 # GPU image for TTS synthesis + ASR
@@ -291,10 +298,115 @@ class ASRModel:
         }
 
 
-# --- CPU function: web server with translation + static files ---
+# --- Translation helpers (plain Python, used by Translator) ---
+
+_EXPANSIONS = {
+    "hows": "how is", "whats": "what is", "thats": "that is",
+    "whos": "who is", "wheres": "where is", "heres": "here is",
+    "theres": "there is", "lets": "let us", "dont": "do not",
+    "doesnt": "does not", "didnt": "did not", "cant": "can not",
+    "wont": "will not", "isnt": "is not", "arent": "are not",
+    "wasnt": "was not", "werent": "were not", "im": "I am",
+    "ive": "I have", "youre": "you are", "youve": "you have",
+    "youll": "you will", "theyre": "they are", "weve": "we have",
+    "gonna": "going to", "wanna": "want to", "gotta": "got to",
+}
+_EXPAND_RE = re.compile(r"\b(" + "|".join(re.escape(k) for k in _EXPANSIONS) + r")\b", re.IGNORECASE)
+
+def _expand_contractions(text):
+    return _EXPAND_RE.sub(lambda m: _EXPANSIONS.get(m.group(0).lower(), m.group(0)), text)
+
+def _normalize_text(text):
+    text = _expand_contractions(text)
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    result = []
+    for s in sentences:
+        s = s.strip()
+        if s:
+            s = s[0].upper() + s[1:]
+            result.append(s)
+    text = " ".join(result)
+    if text and text[-1] not in ".!?":
+        text += "."
+    return text
+
+def _dedup_words(text):
+    """Collapse runs of 3+ identical words — the NLLB degenerate-loop artifact
+    (e.g. 'dozi dozi dozi dozi'). A 2x pair is left intact because Igbo
+    reduplication is grammatical ('obere obere' = little by little, 'ọsọ ọsọ'
+    = quickly), so we must not strip it."""
+    words = text.split()
+    out = []
+    run = 0
+    for w in words:
+        if out and out[-1].lower() == w.lower():
+            run += 1
+            if run >= 2:  # 3rd+ identical in a row → drop
+                continue
+        else:
+            run = 0
+        out.append(w)
+    return " ".join(out)
+
+def _split_sentences(text):
+    parts = re.split(r'(?<=[.!?])\s+', text)
+    return [p.strip() for p in parts if p.strip()]
+
+
+# --- CPU class: NLLB-200 translation ---
+#
+# Split from the web function 2026-11-04. The web container also serves the keyboards'
+# pings, sign-ups and reports; loading torch + this 600M model there made each of those
+# wait ~22 s on a cold start. Now only a translation wakes this container.
+# No @modal.concurrent: one translation per container at a time, because each call sets
+# the shared tokenizer's src_lang. Modal adds containers when requests queue.
+
+@app.cls(
+    image=cpu_image,
+    timeout=120,
+    scaledown_window=300,
+    max_containers=2,  # a burst queues here instead of starting a 22 s model load per request
+)
+class Translator:
+    @modal.enter()
+    def load(self):
+        import torch
+        from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+
+        self.torch = torch
+        self.tok = AutoTokenizer.from_pretrained("facebook/nllb-200-distilled-600M")
+        self.model = AutoModelForSeq2SeqLM.from_pretrained("facebook/nllb-200-distilled-600M")
+        self._generate("hello", "eng_Latn", "ibo_Latn")  # warm up
+
+    def _generate(self, text, src, tgt):
+        self.tok.src_lang = src
+        inputs = self.tok(text, return_tensors="pt", padding=True, truncation=True, max_length=128)
+        with self.torch.no_grad():
+            generated = self.model.generate(
+                **inputs,
+                forced_bos_token_id=self.tok.convert_tokens_to_ids(tgt),
+                max_new_tokens=128,
+                repetition_penalty=1.2,
+            )
+        return self.tok.batch_decode(generated, skip_special_tokens=True)[0]
+
+    @modal.method()
+    def to_igbo(self, text: str) -> str:
+        normalized = _normalize_text(text)
+        sentences = _split_sentences(normalized)[:MAX_SENTENCES]
+        if len(sentences) <= 1:
+            sentences = [normalized]
+        return " ".join(_dedup_words(self._generate(s, "eng_Latn", "ibo_Latn")) for s in sentences)
+
+    @modal.method()
+    def to_english(self, text: str) -> str:
+        return self._generate(text, "ibo_Latn", "eng_Latn")
+
+
+# --- Web function: static files, pings, sign-ups, reports; forwards translation ---
 
 @app.function(
-    image=cpu_image,
+    image=web_image,
     timeout=120,
     scaledown_window=300,
     secrets=[modal.Secret.from_name("speakigbo-beta")],
@@ -308,10 +420,8 @@ def web():
     import json
     import logging
     import os
-    import re
     import time
 
-    import torch
     from fastapi import FastAPI, HTTPException, Request
     from fastapi.staticfiles import StaticFiles
     from pydantic import BaseModel
@@ -319,92 +429,7 @@ def web():
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger(__name__)
 
-    # Load NLLB-200 on CPU — fast and lightweight
-    logger.info("Loading NLLB-200 on CPU...")
-    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
-
-    nllb_tokenizer = AutoTokenizer.from_pretrained("facebook/nllb-200-distilled-600M")
-    nllb_model = AutoModelForSeq2SeqLM.from_pretrained("facebook/nllb-200-distilled-600M")
-    # Warm up
-    _inp = nllb_tokenizer("hello", return_tensors="pt", padding=True)
-    with torch.no_grad():
-        nllb_model.generate(**_inp, forced_bos_token_id=nllb_tokenizer.convert_tokens_to_ids("ibo_Latn"), max_new_tokens=8)
-    logger.info("NLLB-200 ready.")
-
-    # --- Translation helpers ---
-
-    _EXPANSIONS = {
-        "hows": "how is", "whats": "what is", "thats": "that is",
-        "whos": "who is", "wheres": "where is", "heres": "here is",
-        "theres": "there is", "lets": "let us", "dont": "do not",
-        "doesnt": "does not", "didnt": "did not", "cant": "can not",
-        "wont": "will not", "isnt": "is not", "arent": "are not",
-        "wasnt": "was not", "werent": "were not", "im": "I am",
-        "ive": "I have", "youre": "you are", "youve": "you have",
-        "youll": "you will", "theyre": "they are", "weve": "we have",
-        "gonna": "going to", "wanna": "want to", "gotta": "got to",
-    }
-    _EXPAND_RE = re.compile(r"\b(" + "|".join(re.escape(k) for k in _EXPANSIONS) + r")\b", re.IGNORECASE)
-
-    def _expand_contractions(text):
-        return _EXPAND_RE.sub(lambda m: _EXPANSIONS.get(m.group(0).lower(), m.group(0)), text)
-
-    def _normalize_text(text):
-        text = _expand_contractions(text)
-        sentences = re.split(r'(?<=[.!?])\s+', text)
-        result = []
-        for s in sentences:
-            s = s.strip()
-            if s:
-                s = s[0].upper() + s[1:]
-                result.append(s)
-        text = " ".join(result)
-        if text and text[-1] not in ".!?":
-            text += "."
-        return text
-
-    def _dedup_words(text):
-        """Collapse runs of 3+ identical words — the NLLB degenerate-loop artifact
-        (e.g. 'dozi dozi dozi dozi'). A 2x pair is left intact because Igbo
-        reduplication is grammatical ('obere obere' = little by little, 'ọsọ ọsọ'
-        = quickly), so we must not strip it."""
-        words = text.split()
-        out = []
-        run = 0
-        for w in words:
-            if out and out[-1].lower() == w.lower():
-                run += 1
-                if run >= 2:  # 3rd+ identical in a row → drop
-                    continue
-            else:
-                run = 0
-            out.append(w)
-        return " ".join(out)
-
-    def _nllb_translate(text):
-        nllb_tokenizer.src_lang = "eng_Latn"
-        inputs = nllb_tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=128)
-        with torch.no_grad():
-            generated = nllb_model.generate(
-                **inputs,
-                forced_bos_token_id=nllb_tokenizer.convert_tokens_to_ids("ibo_Latn"),
-                max_new_tokens=128,
-                repetition_penalty=1.2,
-            )
-        result = nllb_tokenizer.batch_decode(generated, skip_special_tokens=True)[0]
-        return _dedup_words(result)
-
-    def _split_sentences(text):
-        parts = re.split(r'(?<=[.!?])\s+', text)
-        return [p.strip() for p in parts if p.strip()]
-
-    def translate_to_igbo(text: str) -> str:
-        normalized = _normalize_text(text)
-        sentences = _split_sentences(normalized)[:MAX_SENTENCES]
-        if len(sentences) <= 1:
-            return _nllb_translate(normalized)
-        return " ".join(_nllb_translate(s) for s in sentences)
-
+    translator = Translator()
     # Reference to GPU classes (split 2026-09-15 — see class comments above)
     tts_model = TTSModel()
     asr_model = ASRModel()
@@ -581,7 +606,7 @@ def web():
             raise HTTPException(status_code=400, detail=f"Text too long (max {MAX_TRANSLATE_CHARS} chars).")
         _gate(request)
         t0 = time.time()
-        igbo_text = translate_to_igbo(req.text.strip())
+        igbo_text = await translator.to_igbo.remote.aio(req.text.strip())
         logger.info(f"Translation: {time.time()-t0:.2f}s")
         return {"igbo_text": igbo_text}
 
@@ -615,16 +640,8 @@ def web():
             raise HTTPException(status_code=400, detail=f"Text too long (max {MAX_TRANSLATE_CHARS} chars).")
         _gate(request)
         t0 = time.time()
-        nllb_tokenizer.src_lang = "ibo_Latn"
-        inputs = nllb_tokenizer(req.text.strip(), return_tensors="pt", padding=True, truncation=True, max_length=128)
-        with torch.no_grad():
-            generated = nllb_model.generate(
-                **inputs,
-                forced_bos_token_id=nllb_tokenizer.convert_tokens_to_ids("eng_Latn"),
-                max_new_tokens=128,
-                repetition_penalty=1.2,
-            )
-        english_text = nllb_tokenizer.batch_decode(generated, skip_special_tokens=True)[0]
+
+        english_text = await translator.to_english.remote.aio(req.text.strip())
         logger.info(f"Igbo→English: {time.time()-t0:.2f}s")
         return {"english_text": english_text}
 
